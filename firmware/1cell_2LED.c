@@ -1,0 +1,920 @@
+/********************************************************************
+* FILE NAME: 1cell_2LED                                             *
+*                                                                   *
+* PURPOSE: Main Controll File                                       *
+*                                                                   *
+* FILE REFERENCES:                                                  *
+*                                                                   *
+* Name  I/O   Description                                           *
+* ----  ---   -----------                                           *
+*                                                                   *
+* EXTERNAL VARIABLES:                                               *
+* Source: <>*
+**
+* Name  Type  I/O Description *
+* ----  ----  --- ----------- *
+* *
+* EXTERNAL REFERENCES:  *
+* *
+* Name  Description *
+* ----  ----------- *
+* *
+* ABNORMAL TERMINATION CONDITIONS, ERROR AND WARNING MESSAGES:  *
+* *
+* ASSUMPTIONS, CONSTRAINTS, RESTRICTIONS: *
+* *
+* NOTES:  *
+* *
+* REQUIREMENTS/FUNCTIONAL SPECIFICATIONS REFERENCES:  *
+* *
+* DEVELOPMENT HISTORY:  *
+* *
+* Date  Author  Change Id   Release  Description Of Change * 
+* ----  ------  ---------   -------  --------------------- *
+* *
+* ALGORITHM (PDL) *
+* *
+*******************************************************************/
+
+
+
+//needs to come first as things in the includes depend on it
+#define F_CPU    8000000L
+//#define __AVR_ATtiny84A__
+
+
+
+
+#include <avr/io.h> 
+#include "avr035.h"
+#include <util/delay.h>
+#include <avr/wdt.h>
+#include <avr/power.h>
+#include <avr/interrupt.h>
+#include <avr/eeprom.h>
+#include <avr/sleep.h> 
+
+
+
+#define LED_L_PORT  PORTA // Pin Defs for the Left LED (top view)
+#define LED_L_PIN   PA7
+#define LED_L_DDR   DDRA
+#define LED_L_LED  LED_L_PORT, LED_L_PIN
+
+#define LED_R_PORT  PORTB // Pin Defs for the RIGHT LED (top view)
+#define LED_R_PIN   PB2
+#define LED_R_DDR   DDRB
+#define LED_R_LED  LED_R_PORT, LED_R_PIN
+
+
+#define BT_NEXT_PORT  PORTD  //next (menu) button
+#define BT_NEXT_PIN   PD6 
+#define BT_NEXT_DDR   DDRD
+#define BT_NEXT_OUT  BT_NEXT_PORT, BT_NEXT_PIN
+#define BT_NEXT  PIND, BT_NEXT_PIN
+
+#define BUTTON1_PORT  PORTB  //*the* button there is only one, get over it.
+#define BUTTON1_PIN   PB0 
+#define BUTTON1_DDR   DDRB
+#define BUTTON1_OUT   BUTTON1_PORT, BUTTON1_PIN
+#define BUTTON1  PINB	, BUTTON1_PIN
+
+#define CHARGE_PORT  PORTB  //charge status indicator
+#define CHARGE_PIN   PB1 
+#define CHARGE_DDR   DDRB
+#define CHARGE_OUT   CHARGE_PORT, CHARGE_PIN
+#define CHARGE  PINB	, CHARGE_PIN
+
+#define NUM_OF_LED_STATES 6  //how many LED output states we have
+
+#define LOCK_START 1536
+#define LOCK_END 2046
+
+#define SHOP_START 4096
+#define SHOP_END 4608
+
+#define BUTTON_STUCK 5000
+#define LOW_BATTERY_CUTOFF 89
+#define LOW_BATTERY_WARN 82
+
+struct LED_data {
+  uint8_t setpoint_index;      //which setpoint this channel is currently set at
+  uint8_t seeking;          //are we searching for a lock 0 = locked, decrement when close to target
+  uint8_t setpoints[NUM_OF_LED_STATES];         // array of setpoint values
+  uint8_t hints[NUM_OF_LED_STATES];         // array of hints for PWM output. Should be the minimum value, ie at max voltage it shouldn't cause excess current.
+  uint32_t ADC_value;          // keep it here so we can do smoothing on it   volatile uint8_t *PWM_out;   // pointer to the PWM out for this channel
+  uint8_t pwm_buffer;
+  uint8_t pwm_dither;
+  volatile uint8_t *PWM_out;   // pointer to the PWM out for this channel
+  };
+
+struct LED_data LEDS[4]; //holds the LED struct for the LEDs, order is 0=left 1=right
+const uint8_t LED_L = 0;
+const uint8_t LED_R = 1;
+const uint8_t VBAT = 2;
+
+uint8_t working_LED = 0; //which LED we are working on, IE ADC and PWM. set in the timer
+uint8_t ADC_changed = 0; //set this if we change the ADC channel, use it to toss the first result of an ADC conversion
+volatile uint8_t debounce = 0;
+//volatile uint8_t vbat;
+
+volatile uint8_t adc_mode; //what we are currently sampling
+volatile uint8_t adc_in_use;
+
+volatile uint8_t SETPOINT_L = 0;
+volatile uint8_t SETPOINT_R = 0;
+volatile uint8_t charging = 0;
+
+
+volatile uint8_t charge_from_boot = 0;
+
+const uint8_t AMUX_L = (1 << REFS1) | 0b001111; //  Set ADC reference to internal reference, 20x amplification, ADC1(PA1,pin2,LED_L) differential with ADC3 as -ve
+const uint8_t AMUX_R = (1 << REFS1) | 0b010001; //  Set ADC reference to internal reference, 20x amplification, ADC2(PA2,pin3,LED_R) differential with ADC3 as -ve
+const uint8_t AMUX_VBAT =  0b100001; //   Set ADC reference to VCC, measure internal reference
+
+uint8_t adc_muxes[3]; // holds the ADCmux info
+
+uint16_t button_hold_down_time = 0;
+uint8_t current_setpoint = 0;
+uint8_t runtime = 0; //how long we have been in a given mode, note capped at 255
+
+uint8_t last_setpoint = 0; // what were we in before we turned off.
+volatile uint8_t killit = 0;
+
+volatile uint8_t LowBatt = 0;
+
+volatile uint8_t vbat_cut_noise = 255;
+volatile uint8_t mode_changed = 64;
+
+enum BUTTON_STATES
+{
+  UP,
+  DOWN
+};
+enum BUTTON_STATES button_state;
+
+enum MODE_STATES
+{
+  NORMAL,
+  LOCK
+};
+enum MODE_STATES mode;
+
+enum SHOP_STATES
+{
+  INSTORE,
+  INUSE
+};
+enum SHOP_STATES shop_flag;
+
+
+
+#define BUTTON_DEBOUNCE_TIME 25 // in timer1 cycles
+#define BUTTON_REPEAT_TIME 50  // how long to hold it before repeating #FIX
+
+void init_sw()
+{
+  LEDS[LED_L].PWM_out = &OCR0B;
+  *(LEDS[LED_L].PWM_out) = 0;
+  LEDS[LED_L].ADC_value = 0;
+  LEDS[LED_L].setpoints[0] = 0;
+  LEDS[LED_L].setpoints[1] = 0;
+  LEDS[LED_L].setpoints[2] = 0;
+  LEDS[LED_L].setpoints[3] = 93;
+  LEDS[LED_L].setpoints[4] = 93;  
+  LEDS[LED_L].setpoints[5] = 0;  
+  LEDS[LED_L].hints[0] = 0;  
+  LEDS[LED_L].hints[1] = 0;  
+  LEDS[LED_L].hints[2] = 0;  
+  LEDS[LED_L].hints[3] = 61;        
+  LEDS[LED_L].hints[4] = 61;
+  LEDS[LED_L].hints[5] = 0;    
+  LEDS[LED_L].setpoint_index = 0;
+  
+  LEDS[LED_R].PWM_out = &OCR0A;
+  *(LEDS[LED_R].PWM_out) = 0;
+  LEDS[LED_R].ADC_value = 0;
+  LEDS[LED_R].setpoints[0] = 0;
+  LEDS[LED_R].setpoints[1] = 10; //10
+  LEDS[LED_R].setpoints[2] = 55;
+  LEDS[LED_R].setpoints[3] = 163;
+  LEDS[LED_R].setpoints[4] = 0;
+  LEDS[LED_R].setpoints[5] = 163;  
+  LEDS[LED_R].hints[0] = 0;  
+  LEDS[LED_R].hints[1] = 35;  
+  LEDS[LED_R].hints[2] = 60;  
+  LEDS[LED_R].hints[3] = 70;
+  LEDS[LED_R].hints[4] = 0; 
+  LEDS[LED_R].hints[5] = 70;     
+  
+  
+  LEDS[LED_R].setpoint_index = 0;
+  
+  adc_muxes[LED_L] = AMUX_L;
+  adc_muxes[LED_R] = AMUX_R;
+  adc_muxes[VBAT] = AMUX_VBAT;
+  
+  shop_flag = INUSE;
+  button_state = UP;
+  
+}
+void init_hw()
+{
+
+
+  clock_prescale_set(clock_div_1); //8mhz
+  
+  
+  //deal with anything that might be floating.
+ //  PORTA=255;
+ //  PORTB=255;
+
+  //set both LEDs out and off
+  SETBIT(LED_R_DDR,LED_R_PIN);
+  C_CLEARBIT(LED_R_LED);  
+  SETBIT(LED_L_DDR,LED_L_PIN);
+  C_CLEARBIT(LED_L_LED);
+  
+  
+
+
+  //set button as input with pullup
+  CLEARBIT(BUTTON1_DDR,BUTTON1_PIN);
+  C_SETBIT(BUTTON1_OUT); //pullup
+
+  CLEARBIT(CHARGE_DDR,CHARGE_PIN);
+  C_SETBIT(CHARGE_OUT); //pullup
+
+
+  //Setup TIMER1 used for house keeping, 16bit timer so overflows every 65536 clocks or approx 122Hz at 8mhz
+  TCCR1B |= (1 << CS10)| (1 << ICNC1); //no prescaler and noise canceler is on
+  TIMSK1=(1<<TOIE1); //enable timer 1 overflow   
+
+  // Setup Timer0 used for PWM outputs, Running at 31Khz at 8mhz
+  OCR0B = 0;  
+  OCR0A = 0;
+  TCCR0A |= ((1 << COM0A1) | (1 << COM0B1) | (1 << WGM01) | (1 << WGM00)); // clear on compare match, fast pwm mode
+  TCCR0B |= ((1 << CS00));
+  TIMSK0=(1<<TOIE0); //overflow interrupt
+
+//  LED_L.PWM_out = &OCR0B;
+
+  
+  //Setup ADC
+// ADCSRA |= (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // Set ADC prescaler to 128 - 125KHz sample rate @ 16MHz 
+  ADCSRB |= (1 << ADLAR); // left align results, 8 bit ftw
+  ADMUX = 0b100001; //give it something to start with
+  ADCSRA |= (1 << ADEN);  // Enable ADC 
+  ADCSRA |= (1 << ADIE);  // Enable ADC Interrupt 
+  ADCSRA |= (1 << ADPS2) | (1 << ADPS1); // prescaler to /64 = 125khz adc clock @ 8mhz
+  
+  GIMSK |= (1 << PCIE1);  //enable pcint1 interrupt source
+  PCMSK1 |= (1 << PCINT8) | (1 << PCINT9);  //turn interrupts on for pin b0/pcint8 , b1/pcint9, button, charger respectivley
+  MCUCR |= (1 << ISC00);   // set the interrupt to fire on any level change of an external interrupt
+ //SETPOINT_R = 50; 
+ 
+ //power_spi_disable();
+ //power_twi_disable();
+ //power_usart_disable();
+ power_usi_disable();
+ ACSR |= (1 << ACD);
+
+}
+void advance_LED()
+{
+  mode_changed = 32;
+  current_setpoint++;
+
+  if (current_setpoint >= NUM_OF_LED_STATES)
+  {
+     current_setpoint = 0;
+     //killit = 1;
+  }
+  //SETPOINT_R = LEDS[LED_L].setpoints[LEDS[LED_L].setpoint_index];
+  LEDS[LED_L].setpoint_index = current_setpoint;                        
+  LEDS[LED_R].setpoint_index = current_setpoint; 
+  LEDS[LED_L].seeking = 20;                        
+  LEDS[LED_R].seeking = 20; 
+ // (*(LEDS[LED_L].PWM_out)) = LEDS[LED_L].hints[current_setpoint];
+ // (*(LEDS[LED_R].PWM_out)) = LEDS[LED_R].hints[current_setpoint];
+  if (LEDS[LED_L].setpoints[LEDS[LED_L].setpoint_index] == 0) 
+  {
+    (*(LEDS[LED_L].PWM_out)) = 0;
+    LEDS[LED_L].pwm_buffer = 0;
+    LEDS[LED_L].pwm_dither = 0;    
+  }
+  if (LEDS[LED_R].setpoints[LEDS[LED_R].setpoint_index] == 0) 
+  {
+    (*(LEDS[LED_R].PWM_out)) = 0;
+    LEDS[LED_R].pwm_buffer = 0;
+    LEDS[LED_R].pwm_dither = 0;
+  }
+  
+  if (current_setpoint == 0)
+  {
+    runtime = 0;
+ //   PCMSK1 |= (1 << PCINT8);  //turn interrupts on for pin b0/pcint8
+ //   sleep_mode();      
+  }
+ 
+}
+
+void shutdown() //turn everything off then go into powerdown, note execution will resume from within this function.
+{
+  cli();
+/*  double flash shutdown notification
+  (*(LEDS[LED_L].PWM_out)) = LEDS[LED_L].hints[3];
+  (*(LEDS[LED_R].PWM_out)) = LEDS[LED_R].hints[3];
+  _delay_ms(100);
+  (*(LEDS[LED_L].PWM_out)) = 0;
+  (*(LEDS[LED_R].PWM_out)) = 0;
+  _delay_ms(100);
+  (*(LEDS[LED_L].PWM_out)) = LEDS[LED_L].hints[3];
+  (*(LEDS[LED_R].PWM_out)) = LEDS[LED_R].hints[3];
+  _delay_ms(100);
+  */
+//reset LED state to being off
+ last_setpoint = current_setpoint; 
+ current_setpoint = NUM_OF_LED_STATES-1;
+ advance_LED();
+
+//really turn it off.  
+  OCR0A = 0;
+  OCR0B = 0;
+  TCCR0A = 0;
+  TCCR0B = 0;     
+  PCMSK1 |= (1 << PCINT8)| (1 << PCINT9);  //turn interrupts on for pin b0/pcint8
+  _delay_ms(256);
+  //power_all_disable();
+  //power_adc_disable();
+
+  ADCSRA &= ~(1 << ADEN);  //disable adc power, the thing in power.h doesnt work
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN); 
+  sleep_enable();  
+  //sleep_bod_disable();
+  sei();
+  sleep_cpu();
+  //power_all_enable();
+  ADCSRA |= (1 << ADEN);  //enable adc power, the thing in power.h doesnt work
+  power_usi_disable();  
+  TCCR0A |= ((1 << COM0A1) | (1 << COM0B1) | (1 << WGM01) | (1 << WGM00)); // clear on compare match, fast pwm mode
+  TCCR0B |= ((1 << CS00)); 
+  vbat_cut_noise = 255;
+
+}    
+
+void idle()
+{
+ cli();
+  set_sleep_mode(SLEEP_MODE_IDLE); 
+  sleep_enable();  
+  sei();
+  sleep_cpu();
+} 
+
+
+void button_down()
+{
+//  static enum BUTTON_STATES last_button_state = UP
+}
+
+void button_up()
+{
+  vbat_cut_noise = 255;
+
+  
+  if ((button_hold_down_time < 50) && (mode != LOCK)) // this is a short button press
+  {
+    if (current_setpoint > 0) //torch is on
+    {
+     killit = 1;
+    } else {                  // torch is off
+
+      current_setpoint = 2;        // full power
+      advance_LED(); 
+    }
+  }
+
+  if ((button_hold_down_time > LOCK_START) && (button_hold_down_time < LOCK_END) && (shop_flag == INUSE)) //toggle lock mode
+  {
+    if (mode == LOCK)
+    {
+      mode = NORMAL;
+    } else {
+     mode = LOCK;
+     killit = 1;
+    }
+  }
+      
+  if ((button_hold_down_time > SHOP_START) && (button_hold_down_time < SHOP_END)) //toggle shop mode
+  {
+    if (shop_flag == INSTORE)
+    {
+      shop_flag = INUSE;
+    } else {
+     shop_flag = INSTORE;
+    }
+  }    
+         
+  button_hold_down_time = 0;
+  
+  if (mode == LOCK)
+  {
+    killit = 1;
+  }
+}
+
+void WDT_off(void)
+{
+   wdt_reset();
+  /* Clear WDRF in MCUSR */
+  MCUSR = 0x00;
+  /* Write logical one to WDCE and WDE */
+  WDTCSR |= (1<<WDCE) | (1<<WDE);
+  /* Turn off WDT */
+  WDTCSR = 0x00;
+}
+
+
+int main ()
+{
+
+  //wdt_disable();
+  WDT_off();
+  //wdt_enable(WDTO_4S);
+  init_sw();
+  init_hw();
+  (*(LEDS[LED_L].PWM_out)) = LEDS[LED_L].hints[3];
+  (*(LEDS[LED_R].PWM_out)) = LEDS[LED_R].hints[3];
+  _delay_ms(100);
+  (*(LEDS[LED_L].PWM_out)) = 0;
+  (*(LEDS[LED_R].PWM_out)) = 0;
+  _delay_ms(100);
+  (*(LEDS[LED_L].PWM_out)) = LEDS[LED_L].hints[3];
+  (*(LEDS[LED_R].PWM_out)) = LEDS[LED_R].hints[3];
+  _delay_ms(100);
+  (*(LEDS[LED_L].PWM_out)) = 0;
+  (*(LEDS[LED_R].PWM_out)) = 0;
+  _delay_ms(100);
+
+  charge_from_boot = 0;
+
+    if (!C_CHECKBIT(CHARGE))
+    {
+      charging = 1;
+    } else {
+      charging = 0;
+    }
+      
+  while (charging == 1)  
+  {
+    uint8_t charge_flash = 0;  //used for the delay loop to flash the charging LED, each count is 10msec
+    charge_flash++;
+    _delay_ms(10);             
+      
+    if (charge_flash > 100)    // reset at 1 second
+    {
+      charge_flash = 0;
+    }
+    
+
+
+    if (charge_flash < 20)
+    {
+      (*(LEDS[LED_L].PWM_out)) = LEDS[LED_L].hints[2];  //medium brightness on the wide angle LED
+      (*(LEDS[LED_R].PWM_out)) = LEDS[LED_R].hints[2];
+    } else {
+      (*(LEDS[LED_L].PWM_out)) = 0;
+      (*(LEDS[LED_R].PWM_out)) = 0;
+    }
+
+    if (!C_CHECKBIT(CHARGE))  //charging has stopped either cable removed or battery full
+    {
+      charging = 1;
+    } else {
+      charging = 0;
+    }
+    
+    if (!C_CHECKBIT(BUTTON1))  //active low, button is pressed kill the charge flash loop
+    {
+      charge_from_boot = 1;
+      charging = 0;
+    }
+          
+    
+  } 
+
+    if (!C_CHECKBIT(CHARGE))  // set the flag again if we got here by the button being pressed.
+    {
+      charging = 1;
+    }   
+        
+//SETPOINT = 130;
+sei();
+  if (C_CHECKBIT(BUTTON1)) //button not pressed
+  {
+    killit = 1;
+  } else {
+    button_down();
+    button_state = DOWN;
+  }
+  
+ while (1 == 1)
+ { 
+   //this will execute after every timer interrupt, and idle the chip when it hits the end of the loop.
+   if (killit == 1)
+   {
+     shutdown();
+     killit = 0;
+   } else {
+     idle(); 
+   }
+ }
+}
+
+
+ISR(ADC_vect) 
+{ 
+  static uint8_t low_bat_noise = 255;
+  static uint8_t SAMPLES_TO_AVG = 1; //how many samples to take to form the average
+  static uint32_t avg_adc_val = 0;
+  static uint16_t num_of_samples = 0; //how many samples have we taken for this channel.
+  static uint16_t battery_delayer = 0;
+  
+  uint8_t adc_val = 0;
+//  uint8_t adjustment_amt = 0;
+  if (mode_changed > 0)
+  {
+    SAMPLES_TO_AVG = 1;
+  } else {
+    SAMPLES_TO_AVG = 128;
+  }
+  if (ADC_changed == 0)
+  {
+    num_of_samples++;
+    avg_adc_val += ADCH;
+    if (num_of_samples >= SAMPLES_TO_AVG )
+    {
+ 
+      adc_val = avg_adc_val / SAMPLES_TO_AVG ;
+      
+      avg_adc_val = 0;
+      num_of_samples = 0;
+      
+      if (working_LED < 2)   
+      {
+        if (LEDS[working_LED].setpoints[current_setpoint] == 0)
+        {
+          //should be off, we shouldn't run this ADC anyway FIXME
+          (*(LEDS[working_LED].PWM_out)) = 0;
+          
+        } else {
+          
+          if ((adc_val > (LEDS[working_LED].setpoints[current_setpoint] )) && (LEDS[working_LED].pwm_buffer > 0))
+          {
+            if (mode_changed > 0)
+            { 
+              LEDS[working_LED].pwm_buffer--;
+            } else {         
+              LEDS[working_LED].pwm_dither--;
+              if (LEDS[working_LED].pwm_dither > 250) //wrapped at zero
+              {
+                LEDS[working_LED].pwm_buffer--;
+                LEDS[working_LED].pwm_dither = 15;
+              }
+            }
+          } 
+          if ((adc_val < (LEDS[working_LED].setpoints[current_setpoint]) && (LEDS[working_LED].pwm_buffer < 255)))
+          {
+            if (mode_changed > 0)
+            { 
+              LEDS[working_LED].pwm_buffer++;
+            } else {         
+              LEDS[working_LED].pwm_dither++;
+              if (LEDS[working_LED].pwm_dither > 15)
+              {
+                LEDS[working_LED].pwm_buffer++;
+                LEDS[working_LED].pwm_dither = 0;
+              }
+            }
+          }
+
+          /*if ((adc_val > (LEDS[working_LED].setpoints[current_setpoint] - 5)) && (adc_val > (LEDS[working_LED].setpoints[current_setpoint] - 5)) && (LEDS[working_LED].seeking > 0))
+          {
+            LEDS[working_LED].seeking--;
+          }          
+          */
+          if ((adc_val != (LEDS[working_LED].setpoints[current_setpoint] ))) // && (LEDS[working_LED].seeking > 0))
+          {
+            ADCSRA |= (1 << ADSC); // take another sample, shoot for convergance quickly
+          }
+          
+        }
+      } else { //vbat
+        if ((working_LED == 2) && (mode_changed == 0)) // battery voltage test
+        {        
+          if (adc_val >= LOW_BATTERY_WARN) //note because of how we measure vbat, lower voltages mean the ADCvalue is greater
+          {
+          
+            if (low_bat_noise > 0)
+            {
+              vbat_cut_noise--;
+            }
+            if (low_bat_noise < 20)
+            {
+              LowBatt = 1;
+            } else {
+              LowBatt = 0;
+            }
+            
+            if (low_bat_noise < 255)
+            {
+              low_bat_noise++;
+            }            
+            
+          }
+               
+          if (adc_val >= LOW_BATTERY_CUTOFF) //note because of how we measure vbat, lower voltages mean the ADCvalue is greater
+          {
+            if (vbat_cut_noise > 0)
+            {
+              vbat_cut_noise--;
+            } else {
+              killit = 1;
+            }
+          } else {
+            
+            if (vbat_cut_noise < 255)
+            {
+              vbat_cut_noise++;
+            }
+          }
+        }
+      }
+
+    working_LED++;
+    if (working_LED == 2)
+    {
+      battery_delayer++;
+      if (battery_delayer == 1024)
+      {
+        ADCSRA &= ~(1 << ADEN);
+        ADMUX = adc_muxes[working_LED]; 
+        ADCSRA |= (1 << ADEN);
+      } else {
+        working_LED = 2;
+      }
+      
+    }
+    if (working_LED == 3)
+    {
+      working_LED = 0;
+    }
+      ADMUX = adc_muxes[working_LED];      
+      ADC_changed = 2;
+      ADCSRA |= (1 << ADSC); // take another sample
+      
+    } else {
+       ADCSRA |= (1 << ADSC); // take another sample
+    }
+    ADCSRA |= (1 << ADSC); // take another sample  
+  } else {
+    adc_val = ADCH; //toss this out
+    ADC_changed--; //decriment to toss out N samples, set in the timer1 ISR.    
+    ADCSRA |= (1 << ADSC); // take another sample
+  }
+
+  
+}
+
+ISR(TIM0_OVF_vect)
+{
+  static uint8_t dither;
+  if (dither > 15)
+  {
+    dither = 0;
+  } else {   
+    dither++;
+  }         
+  
+  if (LEDS[LED_L].pwm_dither < dither)
+  {
+    (*(LEDS[LED_L].PWM_out)) = LEDS[LED_L].pwm_buffer;
+  }  else  {
+      (*(LEDS[LED_L].PWM_out)) = LEDS[LED_L].pwm_buffer + 1;
+  }
+
+  if (LEDS[LED_R].pwm_dither < dither)
+  {
+    (*(LEDS[LED_R].PWM_out)) = LEDS[LED_R].pwm_buffer;
+  }  else  {
+      (*(LEDS[LED_R].PWM_out)) = LEDS[LED_R].pwm_buffer + 1;
+  }      
+}
+
+ISR(TIM1_OVF_vect)
+{
+
+static uint8_t ISR_counter;
+  ISR_counter++;
+  //++;
+  if (debounce == 1)
+  {
+
+    
+  }
+  if (mode_changed > 0)
+  {
+    mode_changed--;
+  }
+  
+  if (debounce > 0)
+    {
+      debounce--;
+      if (debounce == 0)  //run this when we first hit 0, the previous if will stop this from repeating.
+      {
+        PCMSK1 |= (1 << PCINT8)| (1 << PCINT9);  //turn interrupts on for pin b0/pcint8
+        
+        if (!C_CHECKBIT(CHARGE))  //active low, button is pressed
+        {
+          charging = 1;
+          if (charge_from_boot == 0)
+          { 
+            wdt_enable(WDTO_15MS);  //note this isn't stroked anywhere, this will cause a reboot
+          }
+        } else {
+          if (charging == 1)
+          {
+            charging = 0;
+            killit = 1;
+            charge_from_boot = 0;
+          } 
+        }
+        
+        if (!C_CHECKBIT(BUTTON1))  //active low, button is pressed
+        {
+          if (button_state == UP) //needed in case the torch is running and the charger is connected
+          {
+          //  charging = 0;
+            button_down();
+            button_state = DOWN;
+          }
+        } else {
+          if (button_state == DOWN) //needed in case the torch is running and the charger is connected
+          {
+          //  charging = 0;
+            button_up();
+            button_state = UP;
+          }
+        }
+      }
+    }
+  
+  if (button_state == DOWN) 
+  {
+    button_hold_down_time++;
+    runtime = 0; // only counts time in a set state
+
+    if ((mode == LOCK) && (button_hold_down_time == 3)) //turn light on fast if locked
+    {
+      current_setpoint = NUM_OF_LED_STATES - 1;
+      advance_LED();
+    }
+    
+
+    
+    if ((mode == LOCK) && (button_hold_down_time % 64 == 0)) //flash to let user know its in lock mode
+    {
+      if (current_setpoint >= NUM_OF_LED_STATES - 1) //use the two highest powers.
+      {
+         current_setpoint = 1;
+      }
+      advance_LED();
+    }
+if ((button_hold_down_time % 64 == 0) && (button_hold_down_time < 1024) && (mode == NORMAL))
+  {
+    if (current_setpoint >= NUM_OF_LED_STATES - 1) //skip the zero in advance_LED
+    {
+       current_setpoint = 0;
+    }
+    advance_LED();
+  }
+
+ if ((button_hold_down_time < 256) && (button_hold_down_time % 50 == 0) && (mode == LOCK))
+  {
+    if (current_setpoint >= NUM_OF_LED_STATES - 1) //use the two lowest powers.
+    {
+       current_setpoint = 1;
+    }
+    advance_LED();
+  }  
+  
+  if ((button_hold_down_time > 256) && (button_hold_down_time < LOCK_START) && (mode == LOCK))
+  {
+    if (current_setpoint != 0)
+    {
+      current_setpoint = NUM_OF_LED_STATES; 
+      advance_LED();
+    }
+  }
+     
+  if ((button_hold_down_time % 50 == 0) && (button_hold_down_time > LOCK_START) && (button_hold_down_time < LOCK_END) && (shop_flag != INSTORE))
+  {
+    if (current_setpoint >= NUM_OF_LED_STATES - 1) //use the two lowest powers.
+    {
+       current_setpoint = 1;
+    }
+    advance_LED();
+  }  
+
+  if ((button_hold_down_time % 50 == 0) && (button_hold_down_time > SHOP_START) && (button_hold_down_time < SHOP_END))
+  {
+    if (current_setpoint >= NUM_OF_LED_STATES -1) //use the two lowest powers.
+    {
+       current_setpoint = 1;
+    }
+    advance_LED();
+  }
+
+  if ((button_hold_down_time > BUTTON_STUCK))
+  {
+    killit = 1;
+  }
+  }
+  
+  
+  if ((current_setpoint > 0) && (ISR_counter % 120 == 0)) //at least one LED is on and a second has elapsed (roughly 120 counts per second, note lumpy as isr_counter rolls over at 255)
+  {
+    if (runtime < 255)
+    {
+      runtime++;
+      if ((shop_flag == INSTORE) && (runtime > 10))  
+      { 
+        killit = 1;      
+      } 
+    }
+  }
+  
+  if ((killit == 0) && (LowBatt == 1)) // if the battery is low and we aren't going to die for some other reason turn the LED's off for .1 of a second every 2ish seconds
+  {
+    if (ISR_counter == 0)   //when the isr wraps set the output to 0, note this won't set killit, everything keeps running just the output is disabled
+    {
+      last_setpoint = current_setpoint;   //save our position
+      current_setpoint = NUM_OF_LED_STATES-1;
+      advance_LED();
+     }
+    if (ISR_counter == 10)   //this should be about .1 of a second
+    {
+      current_setpoint = last_setpoint; //restore the set point
+      advance_LED();
+     }     
+  }
+
+
+    //static uint8_t current_channel = 0;
+
+    static uint8_t seconds_counter=0;
+    if (ISR_counter % 128 == 0)
+    {
+      seconds_counter++;
+    }
+    
+    
+ /*   if (LEDS[current_channel].setpoints[LEDS[current_channel].setpoint_index] == 0) 
+    {
+      (*(LEDS[current_channel].PWM_out)) = 0;
+      current_channel++;
+    } */
+    
+  /*  if ((seconds_counter % 10 == 0) && (LEDS[current_channel].seeking == 0 ))
+    {
+      ADMUX = adc_muxes[current_channel];
+      working_LED = current_channel;
+      ADC_changed = 30;
+      ADCSRA |= (1 << ADSC); // take another sample
+    }
+    if (LEDS[working_LED].seeking > 0)
+    {*/
+   /* working_LED++;
+    if (working_LED == 3)
+    {
+      working_LED = 0;
+    }
+      ADMUX = adc_muxes[working_LED];      
+      ADC_changed = 2;
+      ADCSRA |= (1 << ADSC); // take another sample
+   */// }
+  //} 
+   ADCSRA |= (1 << ADSC); // take another sample
+
+}
+
+
+
+ISR(PCINT1_vect)
+{
+  PCMSK1 = 0; //disable interrupts on pcint8 to 11
+  debounce = 3; //debounce in timer1 overflow takes care of the button press/release  
+}
+
+
