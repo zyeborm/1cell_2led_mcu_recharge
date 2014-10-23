@@ -483,7 +483,7 @@ int main ()
 
     if (charge_flash < 20)
     {
-      (*(LEDS[LED_L].PWM_out)) = LEDS[LED_L].hints[2];  //low brightness on the wide angle LED
+      (*(LEDS[LED_L].PWM_out)) = LEDS[LED_L].hints[2];  //medium brightness on the wide angle LED
       (*(LEDS[LED_R].PWM_out)) = LEDS[LED_R].hints[2];
     } else {
       (*(LEDS[LED_L].PWM_out)) = 0;
@@ -520,13 +520,9 @@ int main ()
         
 //SETPOINT = 130;
 sei();
-  if (C_CHECKBIT(BUTTON1)) //button not pressed
-  {
-    killit = 1;
-  } else {
-    button_down();
-    button_state = DOWN;
-  }
+
+killit = 1;
+
   
  while (1 == 1)
  { 

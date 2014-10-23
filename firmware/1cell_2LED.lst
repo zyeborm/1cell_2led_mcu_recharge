@@ -1448,7 +1448,7 @@ ISR(ADC_vect)
         if ((working_LED == 2) && (mode_changed == 0)) // battery voltage test
         {        
           if (adc_val >= LOW_BATTERY_WARN) //note because of how we measure vbat, lower voltages mean the ADCvalue is greater
-     84a:	25 35       	cpi	r18, 0x55	; 85
+     84a:	23 35       	cpi	r18, 0x53	; 83
      84c:	18 f1       	brcs	.+70     	; 0x894 <__vector_13+0x2b4>
           {
            // killit = 1;

@@ -95,7 +95,7 @@
 
 #define BUTTON_STUCK 5000
 #define LOW_BATTERY_CUTOFF 89
-#define LOW_BATTERY_WARN 85
+#define LOW_BATTERY_WARN 83
 
 struct LED_data {
   uint8_t setpoint_index;      //which setpoint this channel is currently set at
