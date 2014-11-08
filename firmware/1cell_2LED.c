@@ -168,6 +168,12 @@ enum SHOP_STATES
 };
 enum SHOP_STATES shop_flag;
 
+enum DEMO_STATES
+{
+  DEMO,
+  NODEMO
+};
+enum DEMO_STATES demo_flag;
 
 
 #define BUTTON_DEBOUNCE_TIME 25 // in timer1 cycles
@@ -217,6 +223,7 @@ void init_sw()
   
   shop_flag = INUSE;
   button_state = UP;
+  demo_flag = DEMO;
   
 }
 void init_hw()
@@ -861,6 +868,9 @@ if ((button_hold_down_time % 64 == 0) && (button_hold_down_time < 1024) && (mode
         killit = 1;      
       } 
     }
+
+
+
   }
   
   if ((killit == 0) && (LowBatt == 1)) // if the battery is low and we aren't going to die for some other reason turn the LED's off for .1 of a second every 2ish seconds
@@ -885,6 +895,14 @@ if ((button_hold_down_time % 64 == 0) && (button_hold_down_time < 1024) && (mode
     if (ISR_counter % 128 == 0)
     {
       seconds_counter++;
+  if  (demo_flag == DEMO)
+    {
+      if (current_setpoint >= NUM_OF_LED_STATES - 1) //skip the zero in advance_LED
+      {
+         current_setpoint = 0;
+      }
+      advance_LED();
+    }       
     }
     
     
@@ -914,6 +932,7 @@ if ((button_hold_down_time % 64 == 0) && (button_hold_down_time < 1024) && (mode
    */// }
   //} 
    ADCSRA |= (1 << ADSC); // take another sample
+   
 
 }
 
